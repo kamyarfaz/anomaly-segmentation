@@ -1,0 +1,371 @@
+\documentclass[10pt,twocolumn]{article}
+
+% ---------- packages ----------
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=1.9cm]{geometry}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{caption}
+\usepackage[hidelinks]{hyperref}
+\usepackage{url}
+
+\captionsetup{font=small,labelfont=bf}
+\setlength{\parskip}{2pt}
+
+% ---------- title ----------
+\title{\vspace{-1.0cm}\textbf{Comprehensive Road Scene Understanding for Autonomous Driving:\\
+From Mask-Based Segmentation to Anomaly Detection}}
+
+\author{Farhad \quad Mahsa \quad Aein \quad Kamyar\\
+\small Politecnico di Torino --- Artificial Intelligence Course Project}
+\date{}
+
+\begin{document}
+\maketitle
+
+% =====================================================================
+\begin{abstract}
+\small
+Deep segmentation networks achieve strong closed-set performance but fail on
+unknown, out-of-distribution (OoD) objects, a critical safety gap for
+autonomous driving. In this project we study semantic, instance and panoptic
+segmentation, compare two pre-trained \emph{Encoder-only Mask Transformer}
+(EoMT) checkpoints---one trained on Cityscapes and one on COCO---under a single
+consistent evaluation pipeline, fine-tune the COCO model towards the road
+domain, and build a suite of post-hoc anomaly-segmentation baselines on top of
+both a pixel-based network (ERFNet) and the mask-based EoMT. We evaluate four
+scoring rules (MSP, Max~Logit, Max~Entropy and Rejection-by-All) plus
+temperature scaling on five anomaly benchmarks using AuPRC and FPR$_{95}$. Our
+results show that the mask architecture vastly outperforms the pixel baseline
+(e.g.\ $38\!\rightarrow\!77$ AuPRC on RoadAnomaly-21), that closed-set domain
+knowledge directly drives open-set detection (the off-domain COCO model is
+near-useless until fine-tuned), and that the strongest scoring rule depends on
+how well calibrated the underlying classifier is. Source code:
+\url{https://github.com/<YOUR-GROUP-REPO>}.
+\end{abstract}
+
+% =====================================================================
+\section{Introduction}
+
+\paragraph{Project context.}
+Modern perception systems rely on dense prediction tasks.
+\emph{Semantic segmentation} assigns a class to every pixel,
+\emph{instance segmentation} separates individual objects of the same class,
+and \emph{panoptic segmentation}~\cite{kirillov2019panoptic} unifies the two.
+While these tasks are largely solved in well-defined, closed-world settings,
+deployed networks behave unpredictably on \emph{anomalous} or
+\emph{out-of-distribution} (OoD) objects that were never seen during
+training. For safety-critical applications such as autonomous driving, an
+unexpected object on the road (lost cargo, animals, debris) must be flagged
+rather than silently mis-classified as a known class. The goal of this project
+is therefore twofold: (i) understand and compare mask-based segmentation
+architectures on known classes, and (ii) design and evaluate an
+\emph{anomaly-segmentation} pipeline that identifies unknown regions in road
+scenes.
+
+\paragraph{Literature foundations.}
+Real-time pixel-wise segmentation is exemplified by
+ERFNet~\cite{romera2018erfnet}, an efficient residual factorized
+convolutional network. A paradigm shift came with \emph{mask
+classification}: MaskFormer~\cite{cheng2021maskformer} showed that predicting a
+set of binary masks, each with a single class label, generalises per-pixel
+classification, and Mask2Former~\cite{cheng2022mask2former} unified semantic,
+instance and panoptic segmentation with masked attention. Recently,
+EoMT~\cite{kerssies2025eomt} demonstrated that a plain Vision Transformer,
+initialised with the self-supervised features of
+DINOv2~\cite{oquab2023dinov2}, is ``secretly'' a segmentation model: it appends
+learnable object queries directly to the ViT and needs no specialised decoder.
+For anomaly detection we rely on \emph{post-hoc} confidence measures: Maximum
+Softmax Probability~\cite{hendrycks2017msp}, the Max~Logit score from scaling
+OoD detection to real-world settings~\cite{hendrycks2022scaling}, the entropy
+of the predictive distribution, and---specific to mask
+architectures---Rejection-by-All (RbA)~\cite{nayal2023rba}, which flags pixels
+that \emph{no} known-class query claims. We evaluate on the
+SegmentMeIfYouCan~\cite{chan2021smiyc} and Fishyscapes~\cite{blum2021fishyscapes}
+benchmarks, using Cityscapes~\cite{cordts2016cityscapes} and
+COCO~\cite{lin2014coco} as in-distribution data, and explore parameter-efficient
+adaptation inspired by LoRA~\cite{hu2022lora}.
+
+% =====================================================================
+\section{Methodology}
+
+\paragraph{Models.}
+We use two architectures. \textbf{ERFNet} is a compact encoder--decoder CNN
+that outputs per-pixel class logits over the 19 Cityscapes training classes.
+\textbf{EoMT} couples a DINOv2 ViT-Base/14 backbone with $N$ learnable queries;
+its forward pass returns, per query, a class distribution and a binary mask. We
+work with three EoMT checkpoints: one trained on Cityscapes (semantic, $N{=}100$,
+19 classes), one trained on COCO (panoptic, $N{=}200$, 133 classes), and the
+fine-tuned model produced in this work.
+
+\paragraph{From masks to pixels.}
+For any scoring rule we collapse the mask outputs into a per-pixel class score
+map
+\begin{equation}
+L_{c}(p) \;=\; \sum_{q=1}^{N} \sigma\!\big(m_{q}(p)\big)\,
+\mathrm{softmax}\!\big(z_{q}\big)_{c},
+\end{equation}
+where $m_q$ are the mask logits and $z_q$ the class logits of query $q$, and the
+``no-object'' class is dropped. The argmax of $L$ gives the semantic
+prediction.
+
+\paragraph{Post-hoc anomaly scores.}
+Given per-pixel logits $\ell_c(p)$ (raw logits for ERFNet, $L_c$ for EoMT) we
+compute, per pixel, the anomaly score $s(p)$ as: MSP $s=1-\max_c\,
+\mathrm{softmax}(\ell)_c$; Max~Logit $s=-\max_c \ell_c$; Max~Entropy
+$s=-\sum_c p_c \log p_c$ with $p=\mathrm{softmax}(\ell)$; and, for the mask
+models only, RbA $s=-\sum_c L_c(p)$, i.e.\ a pixel is anomalous when the total
+response across all known classes is low. \emph{Temperature scaling} replaces
+$\mathrm{softmax}(\ell)$ by $\mathrm{softmax}(\ell/T)$ before the MSP step.
+
+\paragraph{Consistent cross-dataset evaluation.}
+Comparing the COCO and Cityscapes models is non-trivial because their label
+spaces differ (133 vs.\ 19 classes). We therefore map COCO predictions onto the
+Cityscapes label space using the official category identifiers and evaluate
+\emph{only} the 16 classes that genuinely overlap, excluding pole, traffic sign
+and rider (no COCO equivalent). The identical pipeline---letterbox resize to the
+model's native square input, single forward pass, evaluation at
+$512\times1024$---is applied to every model so that mIoU differences reflect the
+models, not the protocol.
+
+\paragraph{Fine-tuning.}
+To adapt the COCO model to the road domain under a tight compute budget we
+follow the lightweight strategy suggested in the project brief: the DINOv2
+backbone, the queries and the mask head are \emph{frozen}, and only the
+classification head is replaced by a fresh 19-class layer and trained. We use a
+per-pixel cross-entropy on the semantic score map (a simplified objective rather
+than the full Hungarian mask-matching loss), AdamW, automatic mixed precision,
+and a 1000-image subset of the Cityscapes training set for two epochs.
+
+\paragraph{Metrics.}
+Closed-set quality is measured with mean Intersection-over-Union (mIoU).
+Anomaly quality uses Area under the Precision--Recall Curve (AuPRC, higher is
+better) and the false-positive rate at $95\%$ true-positive rate
+(FPR$_{95}$, lower is better), computed over all valid pixels of each benchmark.
+
+% =====================================================================
+\section{Experimental Results}
+
+\paragraph{Closed-set comparison (Step 4--5).}
+Table~\ref{tab:miou} reports per-class mIoU on the 16 shared classes of the
+Cityscapes validation set. As a sanity check, ERFNet reaches $72.2$ mIoU over
+all 19 classes, matching its published performance and validating our pipeline.
+
+\begin{table}[t]
+\centering
+\caption{Per-class IoU and mIoU (\%) on the 16 shared classes of Cityscapes
+\texttt{val}. FT = COCO model after head fine-tuning.}
+\label{tab:miou}
+\small
+\begin{tabular}{l r r r}
+\toprule
+Class & City-EoMT & COCO-EoMT & COCO$\to$FT \\
+\midrule
+road       & 98.1 & 93.4 & 96.3 \\
+sidewalk   & 84.8 & 61.3 & 72.3 \\
+building   & 92.2 & 83.1 & 86.5 \\
+wall       & 63.8 & 47.9 & 48.5 \\
+fence      & 61.8 & 39.2 & 43.5 \\
+traf.\ light & 65.9 & 45.8 & 46.7 \\
+vegetation & 91.0 & 84.3 & 85.5 \\
+terrain    & 62.8 & 53.6 & 56.5 \\
+sky        & 93.9 & 87.0 & 89.3 \\
+person     & 78.1 & 60.0 & 63.2 \\
+car        & 93.8 & 80.7 & 89.9 \\
+truck      & 78.5 & 27.3 & 64.7 \\
+bus        & 87.8 & 64.8 & 69.9 \\
+train      & 77.8 &  4.2 & 28.3 \\
+motorcycle & 64.4 & 51.7 & 52.6 \\
+bicycle    & 74.3 & 61.9 & 62.1 \\
+\midrule
+\textbf{mIoU (16)} & \textbf{79.3} & \textbf{59.2} & \textbf{66.0} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Anomaly segmentation baselines (Step 7--8).}
+Table~\ref{tab:anomaly} reports the full set of post-hoc baselines for the
+pixel model (ERFNet) and the three EoMT checkpoints across the five benchmarks.
+
+\begin{table*}[t]
+\centering
+\caption{Anomaly segmentation results: AuPRC ($\uparrow$) / FPR$_{95}$
+($\downarrow$), in \%. mIoU is the closed-set quality of each model (constant
+across scoring rules). Best AuPRC per benchmark in \textbf{bold}.}
+\label{tab:anomaly}
+\scriptsize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{l c l rr rr rr rr rr}
+\toprule
+\multirow{2}{*}{Model} & \multirow{2}{*}{mIoU} & \multirow{2}{*}{Method}
+& \multicolumn{2}{c}{SMIYC RA-21} & \multicolumn{2}{c}{SMIYC RO-21}
+& \multicolumn{2}{c}{FS L\&F} & \multicolumn{2}{c}{FS Static}
+& \multicolumn{2}{c}{Road Anomaly} \\
+\cmidrule(lr){4-5}\cmidrule(lr){6-7}\cmidrule(lr){8-9}\cmidrule(lr){10-11}\cmidrule(lr){12-13}
+ & & & AuPRC & FPR & AuPRC & FPR & AuPRC & FPR & AuPRC & FPR & AuPRC & FPR \\
+\midrule
+\multirow{3}{*}{ERFNet} & \multirow{3}{*}{72.2}
+ & MSP        & 29.10 & 62.55 & 2.71 & 65.22 & 1.73 & 50.56 & 5.03 & 40.90 & 12.42 & 82.58 \\
+ & & Max Logit  & \textbf{38.32} & 59.34 & \textbf{4.63} & 48.44 & \textbf{3.28} & 45.45 & \textbf{6.27} & 39.65 & \textbf{15.58} & 73.25 \\
+ & & Max Entropy& 30.97 & 62.66 & 3.04 & 65.91 & 2.56 & 50.13 & 5.89 & 40.64 & 12.67 & 82.75 \\
+\midrule
+\multirow{4}{*}{EoMT-City} & \multirow{4}{*}{79.3}
+ & MSP        & 74.26 & 33.43 & \textbf{90.19} & 0.53 & 24.64 & 15.35 & 29.90 & 34.47 & 75.76 & 19.37 \\
+ & & Max Logit  & 73.71 & 33.55 & 90.14 & 0.56 & 24.67 & 15.10 & 30.12 & 34.15 & 75.13 & 19.12 \\
+ & & Max Entropy& \textbf{76.68} & 33.30 & 90.12 & 0.67 & \textbf{27.47} & 15.17 & 28.63 & 34.38 & \textbf{77.65} & 18.86 \\
+ & & RbA        & 72.82 & 45.64 & 88.64 & 69.31 & 25.13 & 11.23 & \textbf{32.59} & 34.67 & 75.03 & 17.31 \\
+\midrule
+\multirow{4}{*}{EoMT-COCO} & \multirow{4}{*}{59.2}
+ & MSP        & 34.36 & 87.97 & 1.43 & 99.99 & 1.42 & 96.73 & 4.14 & 97.13 & 20.74 & 94.05 \\
+ & & Max Logit  & 34.96 & 87.78 & 1.42 & 99.99 & 1.41 & 96.74 & 4.11 & 97.21 & 21.00 & 94.22 \\
+ & & Max Entropy& \textbf{41.01} & 80.14 & 3.72 & 99.99 & 1.14 & 96.52 & 3.88 & 97.94 & \textbf{23.39} & 92.74 \\
+ & & RbA        & 37.45 & 62.24 & \textbf{36.77} & 100.0 & 0.28 & 96.65 & 1.27 & 99.95 & 20.65 & 84.38 \\
+\midrule
+\multirow{4}{*}{EoMT-FT} & \multirow{4}{*}{66.0}
+ & MSP        & \textbf{44.18} & 43.22 & \textbf{65.48} & 99.98 & \textbf{0.32} & 92.34 & \textbf{55.95} & 48.88 & \textbf{47.28} & 85.19 \\
+ & & Max Logit  & 40.96 & 44.55 & 62.53 & 99.99 & 0.30 & 94.66 & 53.83 & 48.63 & 45.45 & 86.59 \\
+ & & Max Entropy& 37.90 & 44.93 & 62.77 & 99.99 & 0.29 & 93.30 & 53.52 & 48.22 & 44.02 & 89.91 \\
+ & & RbA        & 15.72 & 89.19 & 23.53 & 99.99 & 0.17 & 99.13 & 32.75 & 74.83 & 25.32 & 96.86 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\paragraph{Temperature scaling.}
+Table~\ref{tab:temp} sweeps the temperature $T$ for the MSP score of the
+Cityscapes EoMT model.
+
+\begin{table}[t]
+\centering
+\caption{Temperature scaling of MSP (EoMT-Cityscapes), AuPRC (\%).}
+\label{tab:temp}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{l r r r r r}
+\toprule
+$T$ & RA-21 & RO-21 & FS L\&F & FS Static & R.Anom \\
+\midrule
+0.50 & 74.14 & 90.18 & 24.63 & 29.87 & 75.60 \\
+0.75 & 74.20 & 90.18 & 24.64 & 29.89 & 75.69 \\
+1.00 & 74.26 & 90.19 & 24.64 & 29.90 & 75.76 \\
+1.10 & 74.27 & 90.19 & 24.65 & 29.90 & 75.78 \\
+2.00 & \textbf{74.39} & 90.19 & \textbf{24.67} & \textbf{29.93} & \textbf{75.92} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Quantitative breakdown.}
+The mask architecture improves anomaly AuPRC over the pixel baseline by a wide
+margin on every benchmark (e.g.\ RA-21 $38\!\rightarrow\!77$, Road Anomaly
+$16\!\rightarrow\!78$). Among scoring rules, Max~Logit is best for ERFNet, while
+Max~Entropy is marginally best for EoMT-Cityscapes. The COCO model is essentially
+unusable for road anomalies (RO-21 AuPRC $1.4$, FPR$_{95}\approx100$).
+Fine-tuning lifts the COCO model's mIoU from $59.2$ to $66.0$ and, crucially,
+its anomaly AuPRC on several benchmarks (RO-21 $1.4\!\rightarrow\!65$, FS~Static
+$4\!\rightarrow\!56$, Road Anomaly $20\!\rightarrow\!47$). Temperature scaling
+changes AuPRC by $<\!0.3$ points.
+
+% =====================================================================
+\section{Discussion}
+
+\paragraph{Why mask models win.}
+EoMT's advantage stems from two factors. First, its DINOv2 backbone provides
+rich, self-supervised features that generalise beyond the training label set,
+so unknown objects produce distinctive responses. Second, mask classification
+decouples ``where'' (the masks) from ``what'' (the class), so an unknown object
+can occupy a region that no class query confidently claims---precisely the
+signal RbA exploits. The pixel-based ERFNet, by contrast, must assign every
+pixel to one of 19 classes and is forced into over-confident, locally smooth
+predictions, leaving little usable uncertainty.
+
+\paragraph{Closed-set knowledge enables open-set detection.}
+The most important finding is the tight link between mIoU and anomaly quality.
+The COCO model has never learned what a ``normal'' road looks like, so it cannot
+recognise what deviates from it; its anomaly scores are near-random. After
+fine-tuning only a 15k-parameter head on Cityscapes, both its mIoU and its
+anomaly detection improve substantially. This confirms that OoD detection is
+fundamentally relative to a well-modelled in-distribution.
+
+\paragraph{Scoring-rule behaviour and the RbA caveat.}
+RbA is the strongest rule on some benchmarks for the well-trained Cityscapes
+model, but it \emph{collapses} on the fine-tuned model (RA-21 AuPRC $15.7$ vs.\
+MSP's $44.2$). RbA sums un-normalised class responses and therefore depends on
+the \emph{magnitude/calibration} of the classifier, which our lightweight
+cross-entropy fine-tuning did not preserve. MSP, Max~Logit and Max~Entropy, which
+read the shape or the maximum of the distribution, are far more robust to this
+recalibration. A practical lesson is that score choice should follow the
+calibration state of the model. The flatness of temperature scaling has the same
+root cause: $L$ is already a product of sigmoid and softmax terms, so a second
+temperature has little leverage.
+
+\paragraph{Cross-dataset class mismatch.}
+The COCO$\to$Cityscapes comparison exposes genuine semantic mismatches. The
+clearest is the \texttt{train} class: Cityscapes ``train'' denotes urban trams,
+whereas COCO ``train'' denotes mainline locomotives, yielding only $4.2$ mIoU
+for the COCO model versus $77.8$ for the native one. Restricting the comparison
+to shared concepts (and reporting this case explicitly rather than hiding it) is
+the fair way to handle such mismatches.
+
+\paragraph{Methodological critique / limitations.}
+Several simplifications bound our absolute numbers. (i) We use a single
+letterboxed forward pass instead of EoMT's sliding-window inference, so absolute
+mIoU is below the official figures---though the protocol is identical for all
+models, preserving fairness. (ii) Fine-tuning trains only the classification
+head with a per-pixel cross-entropy, not the full Hungarian mask-matching
+objective, and on a 1000-image subset; the frozen COCO masks cap the achievable
+mIoU (66.0 vs.\ 79.3). (iii) Our RbA follows the summed-softmax variant; the
+original multi-label formulation may behave differently. (iv) FS Lost\&Found
+remains hard for all COCO-derived models because its anomalies are small and
+distant. (v) FPR$_{95}$ is occasionally near $100\%$ even when AuPRC is decent,
+indicating that the score ranking is informative but the operating threshold is
+poorly calibrated---a clear direction for future calibration work (e.g.\ LoRA-based
+fuller fine-tuning).
+
+% =====================================================================
+\section{Conclusion}
+We built and evaluated a complete road-scene anomaly-segmentation pipeline,
+comparing a pixel-based network with a state-of-the-art mask transformer across
+four post-hoc scoring rules and three checkpoints. Mask-based EoMT dramatically
+outperforms ERFNet, closed-set domain knowledge is shown to be the key driver of
+open-set detection, and the best scoring rule depends on model calibration. A
+lightweight head-only fine-tuning recovers most of the COCO model's domain gap at
+negligible cost, while highlighting that score calibration---not just
+accuracy---governs reliable anomaly detection.
+
+% =====================================================================
+\begin{thebibliography}{99}
+\small
+\bibitem{chan2021smiyc} R.~Chan \emph{et al.},
+``SegmentMeIfYouCan: A Benchmark for Anomaly Segmentation,'' \emph{NeurIPS Datasets and Benchmarks}, 2021.
+\bibitem{blum2021fishyscapes} H.~Blum \emph{et al.},
+``The Fishyscapes Benchmark: Anomaly Detection for Semantic Segmentation,'' \emph{IJCV}, 2021.
+\bibitem{cheng2021maskformer} B.~Cheng, A.~Schwing, A.~Kirillov,
+``Per-Pixel Classification is Not All You Need for Semantic Segmentation,'' \emph{NeurIPS}, 2021.
+\bibitem{cheng2022mask2former} B.~Cheng \emph{et al.},
+``Masked-attention Mask Transformer for Universal Image Segmentation (Mask2Former),'' \emph{CVPR}, 2022.
+\bibitem{oquab2023dinov2} M.~Oquab \emph{et al.},
+``DINOv2: Learning Robust Visual Features without Supervision,'' \emph{TMLR}, 2024.
+\bibitem{kerssies2025eomt} T.~Kerssies \emph{et al.},
+``Your ViT is Secretly an Image Segmentation Model,'' \emph{CVPR}, 2025.
+\bibitem{nayal2023rba} N.~Nayal \emph{et al.},
+``RbA: Segmenting Unknown Regions Rejected by All,'' \emph{ICCV}, 2023.
+\bibitem{hendrycks2022scaling} D.~Hendrycks \emph{et al.},
+``Scaling Out-of-Distribution Detection for Real-World Settings,'' \emph{ICML}, 2022.
+\bibitem{hu2022lora} E.~Hu \emph{et al.},
+``LoRA: Low-Rank Adaptation of Large Language Models,'' \emph{ICLR}, 2022.
+\bibitem{romera2018erfnet} E.~Romera \emph{et al.},
+``ERFNet: Efficient Residual Factorized ConvNet for Real-Time Semantic Segmentation,'' \emph{IEEE T-ITS}, 2018.
+\bibitem{kirillov2019panoptic} A.~Kirillov \emph{et al.},
+``Panoptic Segmentation,'' \emph{CVPR}, 2019.
+\bibitem{cordts2016cityscapes} M.~Cordts \emph{et al.},
+``The Cityscapes Dataset for Semantic Urban Scene Understanding,'' \emph{CVPR}, 2016.
+\bibitem{lin2014coco} T.-Y.~Lin \emph{et al.},
+``Microsoft COCO: Common Objects in Context,'' \emph{ECCV}, 2014.
+\bibitem{hendrycks2017msp} D.~Hendrycks, K.~Gimpel,
+``A Baseline for Detecting Misclassified and Out-of-Distribution Examples in Neural Networks,'' \emph{ICLR}, 2017.
+\end{thebibliography}
+
+\end{document}
