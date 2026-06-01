@@ -1,0 +1,18 @@
+,Cityscapes-EoMT,COCO-EoMT
+road,98.1,93.4
+sidewalk,84.8,61.3
+building,92.2,83.1
+wall,63.8,47.9
+fence,61.8,39.2
+tlight,65.9,45.8
+veg,91.0,84.3
+terrain,62.8,53.6
+sky,93.9,87.0
+person,78.1,60.0
+car,93.8,80.7
+truck,78.5,27.3
+bus,87.8,64.8
+train,77.8,4.2
+moto,64.4,51.7
+bike,74.3,61.9
+mIoU (16),79.3,59.2
